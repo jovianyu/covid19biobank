@@ -7,4 +7,4 @@ editor_options:
   chunk_output_type: console
 ---
 
-Describe your project.
+Initial analysis of the University of Chicago COVID-19 Biobank.
