@@ -1,0 +1,140 @@
+---
+title: "Clinical Data"
+author: "jyu3"
+date: "8/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+## Importing REDCap Data
+
+Utilizing R script from REDCap export, taking most recently modified version.
+* NB: Changes directory temporarily to data directory to eliminate need for modification of REDCap script
+
+```{r redcap}
+setwd("../data/")
+list.files(path = "../code/",
+           pattern = "COVID19Biobank.*r$",
+           full.names = TRUE) %>%
+  magrittr::extract(which.max(file.mtime(.))) %>%
+  source()
+
+patients <- as_tibble(data) %>%
+  filter(redcap_repeat_instrument == "") %>%
+  select(id = record_id, d0 = date_of_covid_symptom_onse) %>%
+  mutate(id = as.double(id)) %>% unique()
+
+```
+
+## Getting oxygenation data
+* Anesthesia related FiO2 measures are almost always 90-100 and don't correspond to physiologic need, so currently filtering out
+
+```{r oxygenation}
+measurements <- readxl::read_excel("../data/all-measurements-part1-2020-07-17-1044.xlsx") %>%
+  bind_rows(readxl::read_excel("../data/all-measurements-part2-2020-07-17-1045.xlsx")) %>%
+  select(id = Study.ID, meas_name = Name.of.Measurement, meas_time = Measurement.Time, value = Value)
+
+meas_o2device_ref <- measurements %>%
+  filter(grepl("OXYGEN DEV", meas_name, ignore.case = TRUE)) %>%
+  select(meas_name) %>% unique()
+meas_fio2_ref <- measurements %>%
+  filter(grepl("FIO2", meas_name, ignore.case = TRUE), !grepl("ANES", meas_name, ignore.case = TRUE)) %>%
+  select(meas_name) %>% unique()
+meas_spo2_ref <- measurements %>%
+  filter(grepl("PULSE OX|SPO2", meas_name, ignore.case = TRUE)) %>%
+  select(meas_name) %>% unique()
+meas_liters_ref <- measurements %>%
+  filter(grepl("OXYGEN FLOW", meas_name, ignore.case = TRUE)) %>%
+  select(meas_name) %>% unique()
+
+meas_o2device <- measurements %>%
+  filter(meas_name %in% meas_o2device_ref$meas_name) %>%
+  rename(device = value) %>% select(-meas_name)
+  
+meas_fio2 <- measurements %>%
+  filter(meas_name %in% meas_fio2_ref$meas_name) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 100, value >= 21) %>%
+  rename(fio2 = value, fio2meas = meas_name)
+  
+meas_spo2 <- measurements %>%
+  filter(meas_name %in% meas_spo2_ref$meas_name) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 100, value >= 0) %>%
+  rename(spo2 = value) %>% select(-meas_name)
+
+meas_liters <- measurements %>%
+  filter(meas_name %in% meas_liters_ref$meas_name) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 15, value >= 0) %>%
+  rename(liters = value) %>% select(-meas_name)
+
+sftrend <- meas_spo2 %>%
+  full_join(meas_fio2, by = c("id", "meas_time")) %>%
+  full_join(meas_liters, by = c("id", "meas_time")) %>%
+  full_join(meas_o2device, by = c("id", "meas_time")) %>%
+  group_by(id) %>%
+  arrange(id, meas_time) %>%
+  mutate(liters = case_when(
+    !is.na(fio2) ~ 0,
+    TRUE ~ liters
+  )) %>%
+  fill(device, liters) %>%
+  mutate(fio2 = case_when(
+    is.na(fio2) & device == "Room Air" ~ 21,
+    is.na(fio2) & !is.na(liters) ~ 20 + liters*4,
+    TRUE ~ fio2
+  )) %>%
+  filter(!is.na(fio2), !is.na(spo2)) %>%
+  mutate(sfratio = spo2/fio2*100.0) %>%
+  left_join(patients, by = c("id")) %>%
+  mutate(dt= meas_time - as.POSIXct(paste0(d0, " 00:00:00"),format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5")) %>%
+  filter(dt > 0) %>%
+  mutate(day = as.integer(floor(dt/60.0/60.0/24.0)),
+         risk = factor(case_when(
+           sfratio >= 400 ~ "Low",
+           sfratio >= 234 ~ "Moderate",
+           TRUE ~ "High"
+         ), levels = c("Low", "Moderate", "High"))
+  )
+
+sftrend_byday <- sftrend %>% 
+  ungroup() %>% group_by(id, day) %>%
+  summarise(
+    med_ratio = median(sfratio),
+    max_ratio = max(sfratio),
+    min_ratio = min(sfratio),
+    mean_ratio = mean(sfratio)
+  ) %>%
+  mutate(d = case_when(day - lag(day) > 1 ~ 1, TRUE ~ NA_real_)) %>%
+  fill(d) %>%
+  filter(is.na(d))
+
+sftrend_byday %>%
+  ggplot(aes(x = day, y = mean_ratio, group = id)) +
+    geom_line()
+ggsave("../output/plot-clinical-sfratio-line.png",w = 15, h = 10)
+
+sftrend_byday %>%
+  mutate(risk = factor(case_when(
+           mean_ratio >= 400 ~ "Low",
+           mean_ratio >= 234 ~ "Moderate",
+           TRUE ~ "High"
+         ))) %>%
+  ggplot(aes(x = day, fill = risk, y = 1)) +
+    geom_bar(position = "fill", stat = "identity")
+ggsave("../output/plot-clinical-sfratio-bar-fill.png",w = 15, h = 10)
+sftrend_byday %>%
+  mutate(risk = factor(case_when(
+           mean_ratio >= 400 ~ "Low",
+           mean_ratio >= 234 ~ "Moderate",
+           TRUE ~ "High"
+         ))) %>%
+  ggplot(aes(x = day, fill = risk, y = 1)) +
+    geom_bar(position = "stack", stat = "identity")
+ggsave("../output/plot-clinical-sfratio-bar-fill.png",w = 15, h = 10)
+```
