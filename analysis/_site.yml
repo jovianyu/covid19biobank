@@ -1,7 +1,7 @@
-name: "covid19biobank"
+name: covid19biobank
 output_dir: ../docs
 navbar:
-  title: "covid19biobank"
+  title: covid19biobank
   left:
   - text: Home
     href: index.html
@@ -9,6 +9,10 @@ navbar:
     href: about.html
   - text: License
     href: license.html
+  right:
+  - icon: fa-github
+    text: Source code
+    href: https://github.com/jovianyu/covid19biobank
 output:
   workflowr::wflow_html:
     toc: yes
