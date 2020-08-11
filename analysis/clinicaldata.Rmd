@@ -7,6 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '../data/' )
 library(tidyverse)
 ```
 
@@ -34,8 +35,8 @@ patients <- as_tibble(data) %>%
 * Anesthesia related FiO2 measures are almost always 90-100 and don't correspond to physiologic need, so currently filtering out
 
 ```{r oxygenation}
-measurements <- readxl::read_excel("../data/all-measurements-part1-2020-07-17-1044.xlsx") %>%
-  bind_rows(readxl::read_excel("../data/all-measurements-part2-2020-07-17-1045.xlsx")) %>%
+measurements <- readxl::read_excel("all-measurements-part1-2020-07-17-1044.xlsx") %>%
+  bind_rows(readxl::read_excel("all-measurements-part2-2020-07-17-1045.xlsx")) %>%
   select(id = Study.ID, meas_name = Name.of.Measurement, meas_time = Measurement.Time, value = Value)
 
 meas_o2device_ref <- measurements %>%
@@ -136,5 +137,5 @@ sftrend_byday %>%
          ))) %>%
   ggplot(aes(x = day, fill = risk, y = 1)) +
     geom_bar(position = "stack", stat = "identity")
-ggsave("../output/plot-clinical-sfratio-bar-fill.png",w = 15, h = 10)
+ggsave("../output/plot-clinical-sfratio-bar-stack.png",w = 15, h = 10)
 ```
