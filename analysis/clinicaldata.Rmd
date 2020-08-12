@@ -14,10 +14,8 @@ library(tidyverse)
 ## Importing REDCap Data
 
 Utilizing R script from REDCap export, taking most recently modified version.
-* NB: Changes directory temporarily to data directory to eliminate need for modification of REDCap script
 
 ```{r redcap}
-setwd("../data/")
 list.files(path = "../code/",
            pattern = "COVID19Biobank.*r$",
            full.names = TRUE) %>%
