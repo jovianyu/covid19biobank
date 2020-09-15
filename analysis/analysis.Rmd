@@ -1,0 +1,1437 @@
+---
+title: "COVID-19 Biobank Analysis"
+author: "jyu3"
+date: "9/5/2020"
+output: html_document
+---
+
+```{r setup}
+########################
+#     KNIT OPTIONS     #
+########################
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '../data/' )
+
+########################
+#      LIBRARIES       #
+########################
+
+library(tidyverse)
+library(reticulate)
+library(gridExtra)
+library(patchwork)
+library(ggpmisc)
+library(ggpubr)
+library(lubridate)
+library(stringr)
+library(survival)
+library(Formula)
+
+```
+
+# Importing REDCap Data, setting global variables
+- Utilizing R script from REDCap export, taking most recently modified version.
+- Long list of specific inclusion/exclusion criteria from separate Excel sheet
+
+```{r redcap_globalvars}
+########################
+#        REDCAP        #
+########################
+
+STR_DATA_DIR_REDCAP <- "../data/redcap/"
+STR_CODE_DIR_REDCAP <- "../../code/redcap/"
+
+# Setting working directory (both for running in knitr and in RStudio)
+knitr::opts_chunk$set(root.dir = STR_DATA_DIR_REDCAP )
+setwd(STR_DATA_DIR_REDCAP)
+
+# Uses REDCap provided script on export, requires installation of Hmisc (Harrell Miscellaneous)
+# Unfortunately, when sourcing this script, all workspace variables are cleared
+list.files(path = STR_CODE_DIR_REDCAP,
+           pattern = "COVID19Biobank.*r$",
+           full.names = TRUE) %>%
+  magrittr::extract(which.max(file.mtime(.))) %>%
+  source()
+
+# Reformatting dataframe into tibble, standardizing MRN format
+tib_redcap <- data %>%
+  as_tibble() %>%
+  mutate(
+    mrn = str_replace(mrn, " ", "")
+  )
+
+# Removing original dataframe
+rm(data)
+
+########################
+#   GLOBAL VARIABLES   #
+########################
+
+# Folders where files are being stored
+# `STR_BIOBANK`: Biobank data on Box from rest of lab
+# `STR_DATAMART_RAW`: Current version of DataMart
+# `STR_DATAMART`: Location to place the preprocessed/cleaned DataMart
+STR_BIOBANK <- "C:/Users/jovia/Box/COVID-19 Biobank/"
+STR_DATAMART_RAW <- "Datamart/Datamart 08122020/"
+STR_DATAMART <- "Datamart/data-preprocessed/"
+
+list_plot_colors <- c(
+  "red3",
+  "orange2",
+  "green3",
+  "blue2"
+)
+
+STR_DATA_DIR_DEMO_CLIN <- "../data/demographics_clinical/"
+STR_DATA_DIR_FLOW <- "../data/flow/"
+STR_DATA_DIR_CYTOKINE <- "../data/cytokine/"
+
+STR_PLOT_DIR_CLINICAL <- "../output/clinical/"
+STR_PLOT_DIR_FLOW <- "../output/flow/"
+STR_PLOT_DIR_CYTOKINE <- "../output/cytokine/"
+
+STR_CODE_DIR_DATAMART <- "../code/datamart/"
+STR_CODE_DIR_CYTOKINE <- "../code/cytokine/"
+
+
+```
+
+# Importing inclusion/exclusion criteria and special cohort info
+- Long list of specific inclusion/exclusion criteria from separate Excel sheet
+- Joining with REDCap list
+
+```{r annotations}
+########################
+#  INCLUSION/EXCLUSION #
+########################
+
+# Imports manually annotated list of patients by ID and reasons for inclusion/exclusion
+# Two columns of "special" annotations and column for tocilizumab use and column for remdesivir use
+tib_patients_annotations <- list.files(path = paste0(STR_BIOBANK, "Demographics, controls, ect"),
+                        pattern = "^Exclusions.*xlsx$",
+                        full.names = TRUE) %>%
+  magrittr::extract(which.max(file.mtime(.))) %>%
+  readxl::read_excel(
+    col_names = c("id", "special1", "special2", "tocitext", "rmdstext"), skip = 1
+  ) %>%
+  mutate(
+    # Logical for tocilizumab use
+    toci = !is.na(tocitext),
+    # Logical for remdesivir use
+    rmds = !is.na(rmdstext),
+    # Logical for patients with a negative COVID-19 swab
+    negative = grepl("neg", special1, ignore.case = TRUE) | grepl("neg", special2, ignore.case = TRUE),
+    # Logical for patients with explicit exclusion criteria
+    exclude = grepl("ex", special1, ignore.case = TRUE) | grepl("ex", special2, ignore.case = TRUE),
+    # Logical for patients with marked for special subgroup analyses
+    special = grepl("special", special1, ignore.case = TRUE) | grepl("special", special2, ignore.case = TRUE),
+    # Category of subgroup
+    specialcat = case_when(
+      special & (grepl("[^c]hem", special1, ignore.case = TRUE) | grepl("[^c]hem", special2, ignore.case = TRUE)) ~ "Cancer - Hematologic",
+      special & (grepl("canc", special1, ignore.case = TRUE) | grepl("canc", special2, ignore.case = TRUE)) ~ "Cancer - Solid",
+      special & (grepl("chemo", special1, ignore.case = TRUE) | grepl("chemo", special2, ignore.case = TRUE)) ~ "Cancer - Uncategorized",
+      special & (grepl("tx", special1, ignore.case = TRUE) | grepl("tx", special2, ignore.case = TRUE)) ~ "Transplant",
+      special & (grepl("biol.*ab", special1, ignore.case = TRUE) | grepl("biol.*ab", special2, ignore.case = TRUE)) ~ "Immunosuppression - Biologics",
+      special & (grepl("steroid", special1, ignore.case = TRUE) | grepl("steroid", special2, ignore.case = TRUE)) ~ "Immunosuppression - Steroids",
+      special & (grepl("mmf", special1, ignore.case = TRUE) | grepl("mmf", special2, ignore.case = TRUE)) ~ "Immunosuppression - Rheumatologic",
+      special & (grepl("aids", special1, ignore.case = TRUE) | grepl("aids", special2, ignore.case = TRUE)) ~ "Immunosuppression - AIDS"
+    ),
+    # Logical for convalescent plasma donors
+    convdonor = grepl("conv.*don", special1, ignore.case = TRUE) | grepl("conv.*don", special2, ignore.case = TRUE),
+    # Logical for convalescent plasma recipients
+    convrecip = grepl("conv.*rec", special1, ignore.case = TRUE) | grepl("conv.*rec", special2, ignore.case = TRUE),
+    # Logical for patients identified at the curbside transitional clinic
+    ctc = grepl("ctc", special1, ignore.case = TRUE) | grepl("ctc", special2, ignore.case = TRUE),
+    # Logical for pediatric patients
+    peds = grepl("peds", special1, ignore.case = TRUE) | grepl("peds", special2, ignore.case = TRUE),
+    # Logical for patients with lung symptoms
+    ili = grepl("ili", special1, ignore.case = TRUE) | grepl("ili", special2, ignore.case = TRUE),
+    # Subgroup with cytosorb or ECMO use
+    cytoecmo = grepl("cyto", special1, ignore.case = TRUE) | grepl("cyto", special2, ignore.case = TRUE) | grepl("ecmo", special1, ignore.case = TRUE) | grepl("ecmo", special2, ignore.case = TRUE),
+    # Defined healthy donors
+    healthy = grepl("healthy", special1, ignore.case = TRUE) | grepl("healthy", special2, ignore.case = TRUE),
+
+    # Defining patients to include for flow/cytokine analysis
+    includeflow = !negative & !exclude & !special & !peds,
+
+    # Defining patients to include for flow/cytokine analysis
+    includecyto = includeflow & !toci
+
+    # Defining patients for healthy controls - not used, only using simple healthy filter above
+    # healthy = (negative & !exclude & !special & !peds & !toci) | healthy
+  )
+
+
+########################
+#     REDCAP MERGE     #
+########################
+
+# List of IDs to with inclusion/exclusion criteria
+tib_patients_all <- tib_redcap %>%
+  mutate(
+    id = as.character(record_id),
+    mrn = as.character(mrn)
+  ) %>%
+  filter(redcap_repeat_instrument == "") %>%
+  select(id, d0 = date_of_covid_symptom_onse, mrn) %>%
+  left_join(tib_patients_annotations, by = c("id")) %>%
+  mutate_at(
+    c(
+      "toci", "rmds", "negative", "exclude", "special", "convdonor", "convrecip", "ctc", "peds", "ili", "cytoecmo", "healthy"
+    ), ~replace_na(., FALSE)
+  ) %>%
+  mutate_at(
+    c(
+      "includeflow", "includecyto"
+    ), ~replace_na(., TRUE)
+  ) %>%
+  unique()
+
+
+########################
+#     EXCEL EXPORT     #
+########################
+
+# List of patients with exclusions/special/other from above, coded with booleans
+tib_patients_annotations %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "patients-exclusions-special-other.xlsx"))
+
+# List of all patients in redcap merged with info from above
+tib_patients_all %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "patients-redcap.xlsx"))
+
+```
+
+# Importing COVID-19 DataMart data
+- Adapted from previous project with REACT COVID-19 through Swedish to accommodate identified data
+- Cleaning text files due to bizarre encoding issues from CRI using Python just because it's way easier than R for basic text manipulation
+-- Using last modified time of the DataMart to minimize need for reprocessing every time this is run
+- Creating a list of hospital encounters using billing information and merging in REDCap data on patients to only include the most recent hospital encounter (Inpatient only)
+
+```{r datamart}
+########################
+# DATAMART: ENCOUNTERS #
+########################
+
+# A list of files in the DataMart with specific column type specifications to minimize issues with read_delim.
+list_str_types <- list(
+  "C19_ENC_XTRA_GAJEWSKI" = cols(admit_dispo = "c", discharge_dispo = "c"),
+  "C19_RX_ADMIN_GAJEWSKI" = cols(prescript_refills = "c"),
+  "C19_RX_ORDER_GAJEWSKI" = cols(prescript_refills = "c")
+)
+
+# Run python script if the data is new
+if(file.info(paste0(STR_BIOBANK, STR_DATAMART_RAW, names(list_str_types)[1], ".txt"))$mtime >
+    file.info(paste0(STR_BIOBANK, STR_DATAMART, names(list_str_types)[1], ".txt"))$mtime ) {
+  string <- py_capture_output(py_run_file(paste0(STR_CODE_DIR_DATAMART, "datamartPreprocess.py")))
+}
+
+# Function for data import to specify column types from above, specify NA values
+fun_import_data <- function( str_filename ) {
+  print(paste0("Importing ", str_filename))
+  columns = cols(mrn = "c", MRN = "c")
+  if(str_filename %in% names(list_str_types)){
+    columns$cols = c(columns$cols, list_str_types[[str_filename]]$cols)
+  }
+  return(
+    read_delim(
+      paste0(STR_BIOBANK, STR_DATAMART, str_filename, ".txt"),
+      col_names = TRUE,
+      escape_double = TRUE,
+      col_types = columns,
+      na = c( "", "NA" ),
+      delim = "|",
+      trim_ws = TRUE
+    )
+  )
+}
+
+# Creating list of encounters, starting with the "extra" info which includes all the dispo/admit info
+tib_encounters_all <- fun_import_data( "C19_ENC_XTRA_GAJEWSKI" ) %>%
+  # Only including encounters with a disposition
+  filter(!is.na(discharge_dispo_id)) %>%
+  # Merging by HAR ID to the primary encounter file by using primary HAR
+  left_join(fun_import_data( "C19_ENC_GAJEWSKI" ), by = c("mrn", "har" = "har_primary", "record_type")) %>%
+  # Removing outpatient encounters
+  filter(encounter_eio == "Inpatient") %>%
+  # Removing second HAR column (secondary HARs, already have primary HAR)
+  select(-har.y) %>%
+  # Grouping by unique MRN/HAR combinations
+  group_by(mrn, har, encounter_eio, record_type) %>%
+  # Only including pb (hb seems to be more for hospital billing and has month-long ranges)
+  filter(record_type == "pb") %>%
+  # Removing HARs that correspond to encounters without time data (not useful/clinical)
+  filter(!is.na(start_date)) %>%
+  summarise(
+    mrn,
+    har,
+    # Getting unique admission/discharge IDs/dispos
+    admit_dispo_id = paste(unique(admit_dispo_id[!is.na(admit_dispo_id)]), collapse = ','),
+    admit_dispo = paste(unique(admit_dispo[!is.na(admit_dispo)]), collapse = ','),
+    discharge_dispo_id = paste(unique(discharge_dispo_id[!is.na(discharge_dispo_id)]), collapse = ','),
+    discharge_dispo = paste(unique(discharge_dispo[!is.na(discharge_dispo)]), collapse = ','),
+    # Given overlaps in start/end dates for same-HAR encounters during irregular billing codings, taking earliest start and latest end
+    start_date = min(start_date),
+    end_date = max(end_date),
+    # Merging E/I/O (ED/Inpatient/Outpatient) info by unique
+    encounter_eio = paste(unique(encounter_eio[!is.na(encounter_eio)]), collapse = ','),
+    # List of unique ICU in/out times
+    icu_in_time = paste(unique(icu_in_time[!is.na(icu_in_time)]), collapse = ','),
+    icu_out_time = paste(unique(icu_out_time[!is.na(icu_out_time)]), collapse = ',')
+  ) %>%
+  # Getting unique only
+  ungroup() %>% unique()
+
+tib_encounters_include <- tib_encounters_all %>%
+  # Joining only patients that are both in REDCap and in DataMart
+  inner_join(tib_patients_all) %>%
+  # Grouping by patient ID to limit to 1 encounter per patient as index healthcare episode
+  group_by(id) %>%
+  # Only include encounters that end after day of symptom onset (so includes patients who became symptomatic after hospitalization)
+  filter(as.POSIXct(end_date,format="%Y-%m-%d",tz="Etc/GMT-5") >= as.POSIXct(d0,format="%Y-%m-%d",tz="Etc/GMT-5")) %>%
+  # Select the first encounter by start date
+  slice_min(start_date) %>%
+  # Merging back in the full list of included patients (will have empty entries for all encounter data)
+  right_join(tib_patients_all)
+
+# QC: Verifying that all inpatient encounters in DataMart are matched with patients in REDCap
+tib_encounters_missing <- tib_encounters_all %>%
+  filter( !(mrn %in% as.character(tib_redcap$mrn)) ) %>%
+  select(mrn) %>%
+  unique()
+
+if(length(tib_encounters_missing$mrn) > 0) {
+  stop("DataMart encounters exist for patients not in REDCap")
+}
+
+########################
+#     EXCEL EXPORT     #
+########################
+
+# List of index inpatient encounters per patient (if they exist)
+tib_encounters_include %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "encounters-inpatient-index.xlsx"))
+
+# List of all inpatient encounters per patient (if they exist)
+tib_encounters_all %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "encounters-inpatient-all.xlsx"))
+
+```
+
+## Getting oxygenation data
+* Anesthesia related FiO2 measures are almost always 90-100 and don't correspond to physiologic need, so currently filtering out
+
+```{r sfratio}
+########################
+#   DATAMART: VITALS   #
+########################
+
+# Getting all oxygenation measurements directly from DataMart
+tib_meas_oxygen_all <- fun_import_data( "C19_FLOW_GAJEWSKI" ) %>%
+  mutate(mrn = as.character(mrn),
+         meas_time = as.POSIXct(recorded_time, format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5")) %>%
+  right_join(tib_encounters_include, by = c("mrn", "har")) %>%
+  select(id, meas_name = flo_meas_name, meas_time, value = meas_value, group = flo_group_name)
+
+oxygen_devices <- c("Room Air", "Nasal Cannula/Low Flow Oxygen", "NIPPV (CPAP, Bipap, HFNC)", "Ventilator")
+
+## Getting reference measurement names
+# Getting device information
+tib_meas_o2device <- tib_meas_oxygen_all %>%
+  filter(grepl("oxygen device|o2 deliv", group, ignore.case = TRUE)) %>%
+  rename(device = value) %>% select(-meas_name) %>%
+  mutate(
+    device_group = factor(
+      case_when(
+        device == "Room Air" ~ oxygen_devices[[1]],
+        grepl("vent", device, ignore.case = TRUE) ~ oxygen_devices[[4]],
+        grepl("bipap|cpap|high flow", device, ignore.case = TRUE) ~ oxygen_devices[[3]],
+        TRUE ~ oxygen_devices[[2]]
+      ),
+      levels = oxygen_devices
+    )
+  )
+# Getting FIO2 levels
+# - Ignoring all anesthesia measurements given likelihood of near 100% FiO2 without a physiologic need/pathologic correlate 
+# - Removing ECMO blender values because this is always going to be at 100% and is used for the circuit
+tib_meas_fio2 <- tib_meas_oxygen_all %>%
+  filter(grepl("fio2", group, ignore.case = TRUE), !grepl("anes|ecmo", meas_name, ignore.case = TRUE)) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 100, value >= 21) %>%
+  rename(fio2 = value, fio2meas = meas_name)
+# Getting all pulse ox measurements
+tib_meas_spo2 <- tib_meas_oxygen_all %>%
+  filter(grepl("spo2", group, ignore.case = TRUE)) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 100, value >= 0) %>%
+  rename(spo2 = value) %>% select(-meas_name)
+# Getting liters/minute flow
+tib_meas_liters <- tib_meas_oxygen_all %>%
+  filter(grepl("oxygen flow", group, ignore.case = TRUE)) %>%
+  mutate(value = as.double(gsub("[^0-9.]", "", value))) %>%
+  filter(!is.na(value), value <= 15, value >= 0) %>%
+  rename(liters = value) %>% select(-meas_name)
+
+########################
+#       SF RATIO       #
+########################
+
+# Merging all measurements
+tib_sftrend <- tib_meas_spo2 %>%
+  full_join(tib_meas_fio2, by = c("id", "meas_time")) %>%
+  full_join(tib_meas_liters, by = c("id", "meas_time")) %>%
+  full_join(tib_meas_o2device, by = c("id", "meas_time")) %>%
+  group_by(id) %>%
+  arrange(id, meas_time) %>%
+  # Only use information from liters/minute when there is no FiO2 already specified, as these are likely from HFNC
+  mutate(
+    liters = case_when(
+      !is.na(fio2) ~ 0,
+      TRUE ~ liters
+    ),
+    device_group = replace(device_group, row_number() == 1, "Room Air"),
+    device_group = factor(
+        case_when(
+        !is.na(liters) & liters > 0 & liters < 7 ~ oxygen_devices[[2]],
+        !is.na(liters) & liters == 0 & fio2 == 21 ~ oxygen_devices[[1]],
+        TRUE ~ as.character(device_group)
+      ),
+      levels = oxygen_devices
+    )
+  ) %>%
+  # Given not all SpO2 measurements are accompanied by a change in LPM, propagate all values down the column
+  fill(device_group, liters) %>%
+  complete(device_group, fill = list("Room Air")) %>%
+  # Generate an FiO2 when LPM exist and no FiO2 exists or for room air
+  mutate(fio2 = case_when(
+    is.na(fio2) & !is.na(liters) & liters > 0 ~ 20 + liters*4,
+    is.na(fio2) & (device_group == "Room Air" | is.na(device_group)) ~ 21,
+    TRUE ~ fio2
+    )
+  ) %>%
+  # Filling in all FiO2 values
+  fill(fio2) %>%
+  # Filling in all the device types
+  fill(device_group) %>%
+  # Remove rows with no SpO2 measurement
+  filter(!is.na(spo2)) %>%
+  # Calculate the SF ratio (SpO2/FiO2 - x100 for ratio)
+  mutate(sfratio = spo2/fio2*100.0) %>%
+  # Getting patient data
+  full_join(tib_patients_all, by = c("id")) %>%
+  # Calculating time since symptom onset
+  mutate(dt= meas_time - as.POSIXct(paste0(d0, " 00:00:00"),format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5")) %>%
+  filter(dt > 0) %>%
+  mutate(day = as.integer(floor(dt/60.0/60.0/24.0))) %>%
+  filter(
+    # Exclude values for patients who transitioned to CMO
+    !((id == "207") & (meas_time >= as.POSIXct("2020-05-05 13:00:00",format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5"))),
+    !((id == "211") & (meas_time >= as.POSIXct("2020-06-26 21:48:00",format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5"))),
+    !((id == "566") & (meas_time >= as.POSIXct("2020-09-09 15:40:00",format="%Y-%m-%d %H:%M:%OS",tz="Etc/GMT-5"))),
+    # Excluding very obvious human entry error
+    spo2 != 9
+  )
+
+# Removing patients who present outside of a 20 day window after symptom onset (likely unrelated hospital encounter)
+tib_sftrend_exclude <- tib_sftrend %>%
+  select(id, day) %>%
+  group_by(id) %>%
+  slice_min(day) %>%
+  filter(day > 30) %>%
+  select(id) %>% unique()
+
+tib_sftrend_filtered <- tib_sftrend %>%
+  filter(!(id %in% tib_sftrend_exclude$id))
+
+# Defining SF ratio groups and cut/break points
+sf_breaks <- c(-1, 234, 314, Inf)
+sf_levels <- c("High (PF <234)", "Moderate (PF 235-314)", "Low (PF >315)")
+
+# Function to turn variable into factor with SF severity
+sf_cut <- function(var, breaks = sf_breaks, levels = sf_levels) {
+  return(
+    cut(var, breaks = breaks, labels = levels, right = FALSE)
+  )
+}
+
+# Getting daily SF ratio values by multiple measures:
+# - At presentation
+# - Best (highest) SF ratio during encounter
+# - Worst (lowest) SF ratio during encounter)
+tib_sftrend_byday <- tib_sftrend_filtered %>% select(id, sfratio, day, toci, rmds, negative, exclude, special, peds) %>%
+  # Adding in patients who did not have a hospitalization (assumed low severity)
+  bind_rows(select(tib_patients_all, id) %>% filter(!(id %in% unique(tib_sftrend$id))) %>% mutate(id = as.character(id))) %>%
+  mutate(sfratio = ifelse(is.na(sfratio), 100.0/0.21, sfratio)) %>%
+  ungroup() %>% group_by(id, day, toci, rmds, negative, exclude, special, peds) %>%
+  summarise(
+    sfratio_max = max(sfratio),
+    sfratio_min = min(sfratio),
+    sfratio_mean = mean(sfratio)
+  ) %>%
+  ungroup() %>%
+  group_by(id) %>%
+  mutate(
+    sfseverity_initial = sf_cut(first(sfratio_mean)),
+    sfseverity_lowest = sf_cut(max(sfratio_mean)),
+    sfseverity_highest = sf_cut(min(sfratio_mean)),
+    sfratio_init = first(sfratio_mean),
+    sfratio_highest = max(sfratio_mean),
+    sfratio_lowest = min(sfratio_mean)
+  )
+
+# Filtering patients to include
+tib_sftrend_byday <- tib_sftrend_byday %>%
+  filter(
+    id %in% (
+      tib_encounters_include %>% filter(includeflow)
+    )$id
+  )
+
+# Summarizing whole hospitalization by worst value during hospitalization
+# Patients who are never admitted to the hospital are given a low severity measure by default
+tib_sftrend_sum <- tib_sftrend_byday %>%
+  select(id, sfseverity_initial, sfseverity_highest, sfratio_init, sfratio_lowest) %>% unique()
+
+# Summarizing length of admission
+tib_sftrend_admissionlength <- tib_sftrend_byday %>%
+  group_by(sfseverity_initial, sfseverity_highest, sfratio_init, sfratio_lowest, id) %>%
+  summarise(admission_length = max(day) - min(day))
+
+
+########################
+#       PLOTTING       #
+########################
+
+fun_plot_sf <- function(ratio) {
+  sfname <- str_split(ratio, "_")[[1]][2]
+  # SF ratio over time
+  plot_line <- tib_sftrend_byday %>%
+    ggplot(aes_string(x = "day", y = "sfratio_mean", group = "id", colour = ratio)) +
+      geom_line() +
+      scale_colour_manual(values = list_plot_colors) +
+      labs(color = paste0(str_to_title(sfname), " Severity"),
+           title = paste0("SF Ratio by Day, Grouped by ", str_to_title(sfname)," Severity")) +
+      ylab("SF Ratio") + xlab("Day")
+  print(plot_line)
+  ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-", sfname , "severity-scatter-line.png"),
+         plot_line, width = 6, height = 4)
+
+  # Percentage of hospitalized patients by group by day
+  plot_fill <- tib_sftrend_byday %>%
+    ggplot(aes_string(x = "day", fill = ratio, y = 1)) +
+      geom_bar(position = "fill", stat = "identity") +
+      scale_fill_manual(values = list_plot_colors) +
+      scale_y_continuous(labels = scales::percent_format()) +
+      labs(fill = paste0(str_to_title(sfname), " Severity"),
+           title = paste0("Percent of Patients by Day, Grouped by ", str_to_title(sfname)," Severity")) +
+      ylab("Percent of Patients") + xlab("Day")
+  print(plot_fill)
+  ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-", sfname, "severity-bar-fill.png"),
+         plot_fill, width = 6, height = 4)
+
+  # Number of hospitalized patients by group by day
+  plot_stack <- tib_sftrend_byday %>%
+    ggplot(aes_string(x = "day", fill = ratio, y = 1)) +
+      geom_bar(position = "stack", stat = "identity") +
+      scale_fill_manual(values = list_plot_colors) +
+      labs(fill = paste0(str_to_title(sfname), " Severity"),
+           title = paste0("Number of Patients by Day, Grouped by ", str_to_title(sfname)," Severity")) +
+      ylab("Number of Patients") + xlab("Day")
+  print(plot_stack)
+  ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-", sfname, "severity-bar-stack.png"),
+         plot_stack, width = 6, height = 4)
+  
+  # Length of admission stratified
+  plot_fill_admission <- tib_sftrend_admissionlength %>%
+    ggplot(aes_string(x = "admission_length", fill = ratio, y = 1)) +
+      geom_bar(position = "fill", stat = "identity") +
+      scale_fill_manual(values = list_plot_colors) +
+      scale_y_continuous(labels = scales::percent_format()) +
+      labs(fill = paste0(str_to_title(sfname), " Severity"),
+           title = paste0("Admission Length, Grouped by ", str_to_title(sfname)," Severity")) +
+      ylab("Percent of Patients") + xlab("Day")
+  print(plot_fill_admission)
+  ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-", sfname, "severity-admitlength-bar-fill.png"),
+         plot_fill_admission, width = 6, height = 4)
+
+  plot_stack_admission <- tib_sftrend_admissionlength %>%
+    ggplot(aes_string(x = "admission_length", fill = ratio, y = 1)) +
+      geom_bar(position = "stack", stat = "identity") +
+      scale_fill_manual(values = list_plot_colors) +
+      labs(fill = paste0(str_to_title(sfname), " Severity"),
+           title = paste0("Admission Length, Grouped by ", str_to_title(sfname)," Severity")) +
+      ylab("Number of Patients") + xlab("Length")
+  print(plot_stack_admission)
+  ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-", sfname, "severity-admitlength-bar-stack.png"),
+         plot_stack_admission, width = 6, height = 4)
+
+}
+
+fun_plot_box_sfoxygen <- function() {
+  tib_plot <- tib_sftrend_filtered %>%
+    filter(
+      id %in% (
+        tib_encounters_include %>% filter(includeflow)
+      )$id
+    )
+  plot_one <- tib_plot %>%
+    ggplot(aes(x = device_group, y = sfratio, color = device_group)) +
+    # Box plot with jitter
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.1, size = 0.1) +
+    # Labels
+    labs(color = "Severity", title = "SF Ratio by Oxygen Delivery") + ylab("SF Ratio") +
+    # Colors
+    scale_colour_manual(values = rev(list_plot_colors)) +
+    # Legend colors
+    guides(color = guide_legend(reverse = TRUE)) +
+    # Remove ticks and variable labels
+    theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())
+  return(plot_one)
+}
+
+fun_plot_sf("sfseverity_initial")
+fun_plot_sf("sfseverity_highest")
+
+plot_box_sfoxygen <- fun_plot_box_sfoxygen()
+print(plot_box_sfoxygen)
+ggsave(paste0(STR_PLOT_DIR_CLINICAL, "sf-to-oxygenmode.png"),
+       plot_box_sfoxygen, width = 6, height = 4)
+
+
+########################
+#     EXCEL EXPORT     #
+########################
+
+# Saving summary SF ratio stats by patient
+tib_sftrend_sum %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "sf-summary.xlsx"))
+
+# Saving daily SF ratio stats by patient
+tib_sftrend_byday %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "sf-daily.xlsx"))
+
+# Saving daily SF ratio stats by patient
+tib_sftrend_admissionlength %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_DEMO_CLIN, "sf-admitlength.xlsx"))
+
+
+```
+
+# Flow Cytometry
+* Getting flow data from PBMCs
+* TODO: Use WBC for absolute counts w/in 24h +/- windows, check for corresponding differential
+
+```{r flow}
+########################
+#    DATAMART: LABS    #
+########################
+
+# Importing DataMart for labs
+tib_labs_all <- fun_import_data( "C19_LABS_GAJEWSKI" ) %>%
+  select(
+    mrn = MRN,
+    time = spec_take_time,
+    lab = component_name,
+    value = ord_value
+  )
+
+# Filtering ALC values only for patients to include
+tib_labs_alc <- tib_labs_all %>%
+  filter(
+    lab == "ABSOLUTE LYMPHOCYTES"
+  ) %>%
+  inner_join(
+    tib_patients_all %>%
+      select(
+        mrn, id
+      )
+  )
+
+########################
+#     FLOW SAMPLES     #
+########################
+
+# Importing flow sample info
+tib_flow_samples <- list.files(path = paste0(STR_BIOBANK, "Flow/Data/results"),
+                        pattern = "^sample.*xlsx$",
+                        full.names = TRUE) %>%
+  magrittr::extract(which.max(file.mtime(.))) %>%
+  readxl::read_excel(
+    col_names = c("flowid", "id", "date", "exp", "qc", "sample", "flowmatch", "unique"), 
+    col_types = c("text", "text", "date", "skip", "text", "text", "text", "text"), 
+    skip = 1
+  )
+
+# Joining in ALC data when available
+tib_flow_samples <- tib_flow_samples %>%
+  left_join(
+    tib_labs_alc
+  ) %>%
+  group_by(unique, lab) %>%
+  # Getting difference between lab draw time and flow date
+  mutate(
+    diff = abs(time - date)/60.0/60.0/24.0
+  ) %>%
+  # Only using values within 24h
+  filter(
+    diff <= 1.0
+  ) %>%
+  # Taking the closest lab value in time
+  slice_min(
+    diff
+  ) %>%
+  # Joining new data back into full sample list
+  right_join(
+    tib_flow_samples
+  )
+
+########################
+#      FLOW DATA       #
+########################
+
+# Getting flow raw data, first getting each of the individual text file names
+tib_flow_raw <- lapply(
+    3:10,
+    function(exp) {
+      return(
+        list.files(path = paste0(STR_BIOBANK, "Flow/Data/results"),
+               pattern = paste0("^Exp", exp, ".*txt$"),
+               full.names = TRUE)[1]
+      )
+    }
+  ) %>%
+  # Importing each TSV, forcing the type of each column as a character
+  lapply(
+    read_tsv,
+    col_types = cols(.default = "c")
+  ) %>%
+  # Adding experiment numbers to each sample name to be able to merge
+  # with sample info
+  map2(
+    3:10,
+    function(tib, exp) {
+      return(
+        mutate(
+          tib,
+          flowmatch = paste0(`Sample:`, "_Exp", exp)
+        )
+      )
+    }
+  ) %>%
+  # Merging each tibble together by row
+  bind_rows() %>%
+  # Removing sample column
+  select(-`Sample:`) %>%
+  # Removing means/SDs from each experiment
+  filter(
+    !grepl("Mean_", flowmatch),
+    !grepl("SD_", flowmatch)
+  )
+
+# Merging sample info with flow data
+tib_flow_all <- tib_flow_samples %>%
+  left_join(
+    tib_flow_raw,
+    by = c("flowmatch")
+  )
+
+# Renaming flow samples
+list_old_names <- colnames(tib_flow_all)[13:length(colnames(tib_flow_all))]
+list_new_names <- unlist(lapply(list_old_names, function(x){return(tail(str_split(x, "/")[[1]], n = 1))}))
+
+# Renaming flow samples
+tib_flow_all <- tib_flow_all %>%
+  rename_at(vars(colnames(.)[13:length(colnames(.))]), ~ list_new_names) %>%
+  # Removing N/A values as 0
+  mutate_at(vars(list_new_names), ~as.numeric(str_replace(.,"n/a", "0")))
+
+list_old_names <- as.list(list_old_names)
+names(list_old_names) <- list_new_names
+
+########################
+#      FLOW GROUPS     #
+########################
+
+# Getting day of measurement, binning into groups
+tib_flow_filtered <- tib_flow_all %>%
+  # QC: Removing contaminated samples
+  filter(qc != "contaminated") %>%
+  # QC: Removing contaminated samples
+  inner_join(tib_patients_all, by = c("id")) %>%
+  filter(includeflow) %>%
+  mutate(day = as.integer(difftime(as.POSIXct(date, format = "%Y-%m-%d", tz = "GMT"),as.POSIXct(d0, format = "%Y-%m-%d", tz = "GMT"),"UTC",units = "days"))) %>%
+  left_join(tib_sftrend_sum, by = c("id")) %>%
+  mutate(daygroup = cut(day, c(-1, 5, 10, 15, Inf), c("Days 1-5", "Days 6-10", "Days 11-15", "Days >15")))
+
+# Getting samples that are health controls
+tib_flow_healthy <- tib_flow_all %>%
+  # QC: Removing contaminated samples
+  filter(qc != "contaminated") %>%
+  filter(id %in% (filter(tib_patients_annotations, healthy)$id))
+
+########################
+#       PLOTTING       #
+########################
+
+# Function to generating a Y axis label using the variable name
+fun_flow_y_label <- function(flow) {
+  label = str_split(flow, " \\| ")[[1]][2]
+  return(
+    case_when(
+      grepl("Freq", label) ~ paste0("Percent of ", str_split(str_replace(label, "Freq. of ", ""), "\\.")[[1]][1], " Cells"),
+      grepl("Median", label) ~ paste0(str_replace(str_replace(label, "Median \\(", ""), "\\)", ""), " MFI"),
+      TRUE ~ label
+    )
+  )
+}
+
+# Function to generating a title using the variable name
+fun_flow_title <- function(flow) {
+  return(str_replace(str_split(flow, " \\| ")[[1]][1], "\\.", " "))
+}
+
+# Function to plot the flow plots with jitter/line plot per time group with a simple linear regression side by side
+fun_plot_flow <- function(flow, error = FALSE){
+  # Subsetting data only including above variable
+  tib_plot <- tib_flow_filtered %>%
+    filter(!(is.na(sfseverity_highest)), !is.na(day)) %>%
+    select(daygroup, flow, sfseverity_highest, day)
+  # Tallying N per group for purposes of labeling, duplicating due to quirk of writing a label per group
+  tib_plot_tally <- tib_plot %>% group_by(daygroup, sfseverity_highest) %>% summarise(ns = n()) %>% left_join(tib_plot %>% group_by(daygroup) %>% tally)
+  # Plot 1: Jitter plot over time
+  plot_one <- tib_plot %>%
+    ggplot(aes_string(x = "daygroup", y = paste0("`", flow, "`"), color = "sfseverity_highest")) +
+    # Jitter plot
+    geom_jitter(width = 0.1) +
+    # Adding trend line from mean to mean, colored by severity
+    stat_summary(fun=mean, geom="line", aes(color=sfseverity_highest, group=sfseverity_highest)) +
+    # Horizontol line for normal donor
+    geom_hline(aes(yintercept = mean(pull(tib_flow_healthy, flow)), colour = "Normal Donor"), linetype = "dashed", color = "grey", size = 1) +
+    # Error bars, default not shown
+    {if(error) stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.05)} +
+    # Somewhat hacky way of showing N for each group at the time at 103% of the max value to ensure it shows up on the plot
+    geom_text(data = tib_plot_tally, aes(label = paste0("n = ", n)), y = max(tib_plot[flow])*1.03, colour="grey20", size=3.5) +
+    # Removing X axis variable name/label
+    theme(axis.title.x=element_blank()) +
+    # Setting titles
+    labs(color = "Severity", title = fun_flow_title(flow)) + ylab(fun_flow_y_label(flow)) +
+    # Using list of colors above
+    scale_colour_manual(values = list_plot_colors)
+
+  # Plot 2: Regression over time
+  # Linear regression
+  formula <- y ~ poly(x, 1, raw = TRUE)
+  plot_two <- tib_plot %>%
+    ggplot(aes_string(x = "day", y = paste0("`", flow, "`"), color = "sfseverity_highest")) +
+    # Plotting linear regression
+    geom_smooth(aes(fill = sfseverity_highest), method = "lm", formula = formula) +
+    # Adding CI
+    stat_poly_eq(
+      aes(label = paste(stat(p.value.label), stat(rr.label), sep = "*\", \"*")),
+      formula = formula,
+      label.x = "right", label.y = "bottom", size = 3,
+      parse = TRUE
+      ) +
+    # Removing X-axis title, legend (since it's used above)
+    theme(axis.title.x=element_blank(), legend.position = "none") +
+    # Adding labels
+    labs(color = "Severity") + ylab(fun_flow_y_label(flow)) +
+    # Using list of colors above
+    scale_colour_manual(values = list_plot_colors) +
+    scale_fill_manual(values = list_plot_colors)
+  return( 
+    list(plot_one, plot_two)
+  )
+}
+
+fun_plot_flow_box <- function(flow){
+  # Creating additional factor level for healthy patients
+  sf_levels_healthy <- c(c("Healthy"), rev(sf_levels))
+  # Box plot data of only flow values within 5 days of day 10 (D5-15)
+  tib_plot <- tib_flow_filtered %>%
+    filter(!(is.na(sfseverity_highest))) %>%
+    select(flow, sfseverity_highest, day, id) %>%
+    mutate(day10 = abs(10 - day)) %>%
+    group_by(id) %>%
+    slice(which.min(day10)) %>%
+    filter(day10 <= 5) %>%
+    bind_rows(select(tib_flow_healthy, flow)) %>%
+    mutate(sfseverity_highest = factor(case_when(
+        is.na(sfseverity_highest) ~ "Healthy",
+        TRUE ~ as.character(sfseverity_highest)
+        ), levels = sf_levels_healthy
+      )
+    )
+  # p-value comparison pairings
+  comparisons <- list(
+    c(sf_levels_healthy[1], sf_levels_healthy[2]),
+    c(sf_levels_healthy[2], sf_levels_healthy[3]),
+    c(sf_levels_healthy[3], sf_levels_healthy[4]),
+    c(sf_levels_healthy[1], sf_levels_healthy[3]),
+    c(sf_levels_healthy[2], sf_levels_healthy[4]),
+    c(sf_levels_healthy[1], sf_levels_healthy[4])
+  )
+  plot_one <- tib_plot %>%
+    ggplot(aes_string(x = "sfseverity_highest", y = paste0("`", flow, "`"), color = "sfseverity_highest")) +
+    # Box plot with jitter
+    geom_boxplot() +
+    geom_jitter(width = 0.1) +
+    # p-values from above
+    stat_compare_means(comparisons = comparisons) +
+    # Labels
+    labs(color = "Severity", title = fun_flow_title(flow)) + ylab(fun_flow_y_label(flow)) +
+    # Colors
+    scale_colour_manual(values = rev(list_plot_colors)) +
+    # Legend colors
+    guides(color = guide_legend(reverse = TRUE)) +
+    # Remove ticks and variable labels
+    theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())
+  return(plot_one)
+}
+
+# List of flow samples to generate figures
+c_flow_celltypes <- c(
+  "B.cells | Freq. of CD45.Live",
+  "CD4 | Freq. of CD45.Live",
+  "CD8 | Freq. of CD45.Live",
+  "NKT cells | Freq. of CD45.Live",
+  "Monocytes | Freq. of CD45.Live",
+  "Neutrophils | Freq. of CD45.Live",
+  "NK cells | Freq. of CD45.Live",
+  "Tfh | Freq. of CD4",
+  "Th1 | Freq. of CD4",
+  "Th17 | Freq. of CD4",
+  "Th2 | Freq. of CD4",
+  "Tregs | Freq. of Parent",
+  "CD4 CM | Freq. of Parent",
+  "CD4 EM | Freq. of Parent",
+  "CD4 Naive | Freq. of Parent",
+  "CD8 CM | Freq. of Parent",
+  "CD8 EM | Freq. of Parent",
+  "CD8 Naive | Freq. of Parent",
+  "CD8 TEMRA | Freq. of Parent"
+  )
+
+c_flow_cell_activ_inhib <- c(
+  "CD4 CD38 HLA-DR DP | Freq. of Parent",
+  "CD4 CD38 pos | Freq. of Parent",
+  "CD4 PD1 pos | Freq. of Parent",
+  "CD4 Tim3 pos | Freq. of Parent",
+  "CD8 CD38 HLA-DR DP | Freq. of Parent",
+  "CD8 CD38 pos | Freq. of Parent"
+)
+
+c_flow_pd1_tim3 <- c(
+  "CD4 EM | Median (PD-1)",
+  "CD4 EM | Median (Tim-3)",
+  "CD4 | Median (PD-1)",
+  "CD4 | Median (Tim-3)",
+  "CD4 Naive | Median (PD-1)",
+  "CD4 Naive | Median (Tim-3)",
+  "CD8 CM | Median (PD-1)",
+  "CD8 CM | Median (Tim-3)",
+  "CD8 EM | Median (PD-1)",
+  "CD8 EM | Median (Tim-3)",
+  "CD8 | Median (PD-1)",
+  "CD8 | Median (Tim-3)",
+  "CD8 Naive | Median (PD-1)",
+  "CD8 Naive | Median (Tim-3)",
+  "CD4 CM | Median (PD-1)",
+  "CD4 CM | Median (Tim-3)",
+  "CD8 TEMRA | Median (PD-1)",
+  "CD8 TEMRA | Median (Tim-3)"
+)
+
+# Testing plots, commented
+# plots <- flatten(lapply(c_flow_celltypes, fun_plot_flow))
+# n <- length(plots)
+# nCol <- ceiling(sqrt(n))
+# do.call("grid.arrange", c(plots, ncol=nCol))
+# flow <- "Plasmablasts | Freq. of CD45.Live"
+# fun_plot_flow_box(flow)
+# fun_plot_flow(flow)
+
+# Saves all 3 plots as images
+fun_flow_png <- function(flow) {
+  plot_flow <- fun_plot_flow(flow)
+  print(plot_flow[[1]])
+  print(plot_flow[[2]])
+  str_name <- flow %>%
+    tolower() %>%
+    str_replace_all("\\. ", "-") %>%
+    str_replace_all("\\| ", "") %>%
+    str_replace_all(" ", "-") %>%
+    str_replace_all("\\.", "-") %>%
+    str_replace_all("\\(", "") %>%
+    str_replace_all("\\)", "")
+  ggsave(paste0(STR_PLOT_DIR_FLOW, str_name, "-scatter-regression.png"),
+         plot_flow[[1]] + plot_flow[[2]], width = 12, height = 4)
+  plot_flow_box <- fun_plot_flow_box(flow)
+  print(plot_flow_box)
+  ggsave(paste0(STR_PLOT_DIR_FLOW, str_name, "-box.png"), plot_flow_box, width = 6, height = 4)
+  return()
+}
+
+# Saves all plots
+lapply(c_flow_celltypes, fun_flow_png)
+lapply(c_flow_cell_activ_inhib, fun_flow_png)
+lapply(c_flow_pd1_tim3, fun_flow_png)
+
+########################
+#     EXCEL EXPORT     #
+########################
+
+# QC: Finding all the flow samples that are being excluded due to special/exclusion criteria
+tib_patients_annotations %>% filter(id %in% setdiff(tib_flow_all$id, tib_flow_filtered$id)) %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_FLOW, "patients-excluded.xlsx"))
+
+# QC: List of included patients in flow analysis
+tib_flow_filtered %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_FLOW, "patients-included-annotated.xlsx"))
+
+# Exporting all flow data
+tib_flow_filtered %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_FLOW, "flow-included.xlsx"))
+tib_flow_healthy %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_FLOW, "flow-healthy.xlsx"))
+tib_flow_all %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_FLOW, "flow-all.xlsx"))
+
+```
+
+# Cytokine data from Luminex
+* Using Python again to generate luminex data as a CSV file, able to take in multiple formats of Excel files due to operator dependencies
+* CODE NOT FINALIZED, pending updated data
+
+```{r cytokine}
+########################
+#   LUMINEX RAW DATA   #
+#       -PYTHON-       #
+########################
+
+# Luminex runs
+list_plex <- list("44", "30")
+
+# Processing Luminex output and manual Excel annotations into CSV files
+lapply(list_plex, function(plex) {py_run_file(paste0(STR_CODE_DIR_CYTOKINE, "luminex2CSV_", plex, "plex.py"))})
+
+########################
+#    LUMINEX IMPORT    #
+########################
+
+tib_cyto_names <- readxl::read_excel(paste0(STR_DATA_DIR_CYTOKINE,"cytokine_names.xlsx"))
+tib_cyto_drop <- tib_cyto_names %>% filter(is.na(Plex30)) %>% select(Plex44)
+tib_cyto_names <- tib_cyto_names %>% filter(!is.na(Plex30))
+
+# Importing each processed Luminex file
+fun_import_luminex <- function(plex) {
+  tib_cytokines <- list.files(path = "../data/cytokine/",
+             pattern = paste0("lum.*", plex, "plex.csv$"),
+             full.names = TRUE) %>%
+    magrittr::extract(which.max(file.mtime(.))) %>%
+    read_csv(col_types = cols(.default = "c")) %>%
+    mutate(id = as.character(id), date = date(date), sample = Sample) %>%
+    group_by(id, date, sample, bmp_sample) %>%
+    mutate(
+      dup = n()
+    ) %>%
+    select(
+      -Location,
+      -Sample
+    )
+  if(plex == "44") {
+    for(cyto in tib_cyto_drop){
+      tib_cytokines <- tib_cytokines %>% select(-contains(cyto))
+    }
+  }
+  for(i in 1:length(tib_cyto_names$Plex30)) {
+    tib_cytokines <- tib_cytokines %>% rename_with(
+      ~gsub(tib_cyto_names[[paste0("Plex",plex)]][i], tib_cyto_names$name[i], .x, fixed = TRUE))
+  }
+  return(tib_cytokines)
+}
+
+# Mark duplicates
+fun_cytokines_dups_plex <- function(tib_plex) {
+  tib_dups <- tib_plex %>%
+    filter(dup > 1) %>%
+    arrange(.by_group = TRUE) %>%
+    select(-starts_with("LIMIT")) %>%
+    summarise_at(vars(ends_with("result")), ~ (max(as.double(.x)) - min(as.double(.x)))/mean(as.double(.x))*100)
+  return(tib_dups)
+}
+
+# Merge all duplicates together
+fun_cytokines_dups_all <- function(list_tib_cytokines) {
+  all_plex_samples <- Reduce(function(x,y){inner_join(x, y, by = c("id", "date"))}, list_tib_cytokines) %>%
+    select(id, date) %>%
+    unique()
+  tib_cytokines_dups_all <- fun_cytokines_dups_plex(bind_rows(lapply(list_tib_cytokines, right_join, all_plex_samples)))
+  return(tib_cytokines_dups_all)
+}
+
+list_tib_cytokines <- lapply(list_plex, fun_import_luminex)
+list_tib_cytokines_dups <- lapply(list_tib_cytokines, fun_cytokines_dups_plex)
+tib_cytokines_dups_all <- fun_cytokines_dups_all(list_tib_cytokines)
+
+# Importing Luminex data, binning into day groups after calculating days after symptom onset
+tib_cytokine_data <- bind_rows(list_tib_cytokines) %>%
+  left_join(tib_patients_all, by = "id") %>%
+  mutate(day = as.integer(difftime(as.POSIXct(date, format = "%Y-%m-%d", tz = "GMT"),as.POSIXct(d0, format = "%Y-%m-%d", tz = "GMT"),"UTC",units = "days"))) %>%
+  left_join(tib_sftrend_sum, by = c("id")) %>%
+  mutate(
+    daygroup = cut(day, c(-1, 5, 10, 15, Inf), c("Days 1-5", "Days 6-10", "Days 11-15", "Days >15")),
+    daygroup_box = cut(day, c(-1, 9, Inf), c("Days 1-9", "Days >10"))
+  )
+
+# Get list of all cytokine names/measures
+cytokine_names <- tib_cytokine_data %>%
+  ungroup() %>%
+  select(starts_with("LIMIT")) %>%
+  colnames() %>%
+  str_replace("LIMIT", "")
+
+tib_cytokine_data <- tib_cytokine_data %>% type_convert() %>% ungroup()
+
+# Boolean for whether to extrapolate additional values or not
+extrapolate <- TRUE
+
+# For loop in order to change values in place
+for(cytokine in cytokine_names) {
+  cytokine_lim <- paste0("LIMIT", cytokine)
+  # Get values at which a "<" was present in original raw data
+  cytokine_min_measure <- tib_cytokine_data %>%
+    ungroup() %>%
+    filter(as.character(!!sym(cytokine_lim)) == "MIN") %>%
+    select(cytokine) %>%
+    unique() %>% unlist() %>% as.double()
+  if(!length(cytokine_min_measure)) {cytokine_min_measure = 0}
+  # Get values at which a ">" was present in original raw data
+  cytokine_max_measure <- tib_cytokine_data %>%
+    ungroup() %>%
+    filter(as.character(!!sym(cytokine_lim)) == "MAX") %>%
+    select(str_replace(cytokine, "LIMIT", "")) %>%
+    unique() %>% unlist() %>% as.double()
+  if(!length(cytokine_max_measure)) {cytokine_max_measure = Inf}
+  # Get lowest extrapolated value
+  cytokine_min_extrap <- tib_cytokine_data %>%
+    ungroup() %>%
+    pull(cytokine) %>%
+    min(na.rm = TRUE) %>% unlist()
+  # Get highest extrapolated value
+  cytokine_max_extrap <- tib_cytokine_data %>%
+    ungroup() %>%
+    pull(cytokine) %>%
+    max(na.rm = TRUE) %>% unlist()
+  # Mark extrapolated values as MIN_EXTRAP or MAX_EXTRAP
+  tib_cytokine_data[[cytokine_lim]] = case_when(
+    tib_cytokine_data[[cytokine]] < cytokine_min_measure ~ "MIN_EXTRAP",
+    tib_cytokine_data[[cytokine]] > cytokine_max_measure ~ "MAX_EXTRAP",
+    TRUE ~ as.character(tib_cytokine_data[[cytokine_lim]])
+  )
+  tib_cytokine_data[[cytokine]] <- case_when(
+    # If extrapolate boolean is TRUE, use min/max extrapolated values
+    (extrapolate & (tib_cytokine_data[[cytokine_lim]] == "MIN")) ~ cytokine_min_extrap,
+    (extrapolate & (tib_cytokine_data[[cytokine_lim]] == "MAX")) ~ cytokine_max_extrap,
+    # Otherwise, set all values that were extrapolated to the lower/upper limits of non-extrapolated measure
+    (!extrapolate & (tib_cytokine_data[[cytokine]] < cytokine_min_measure)) ~ cytokine_min_measure,
+    (!extrapolate & (tib_cytokine_data[[cytokine]] > cytokine_max_measure)) ~ cytokine_max_measure,
+    TRUE ~ tib_cytokine_data[[cytokine]]
+  )
+}
+
+# Making tibble for saving as Excel file with "LIMIT" information preserved
+tib_cytokine_data_save <- tib_cytokine_data %>%
+  ungroup()
+
+# Removing "LIMIT" columns
+tib_cytokine_data <- tib_cytokine_data_save %>%
+  select(-starts_with("LIMIT"))
+
+########################
+#       PLOTTING       #
+########################
+
+# Selecting a single cytokine
+# Performing QC and cutoff set at bead count of 32 and %CV of Inf (no max)
+fun_cytokine_select <- function(cytokine, countmin = 32, cvmax = Inf) {
+  tib_selected <- tib_cytokine_data %>%
+  select(
+    daygroup,
+    daygroup_box,
+    result = paste(cytokine,"result", sep = "_"),
+    count = paste(cytokine,"count", sep = "_"),
+    cv = paste(cytokine,"cv", sep = "_"),
+    sfseverity_highest,
+    sfratio_lowest,
+    id,
+    day,
+    includecyto,
+    bmp_sample
+  ) %>%
+  # Remove N/A value results
+  filter(
+    !is.na(result),
+    # Bead count and %CV cutoffs as above
+    count > countmin,
+    cv < cvmax
+  ) %>%
+  group_by(id, day, sfseverity_highest, sfratio_lowest, daygroup, daygroup_box, includecyto, bmp_sample) %>%
+  # Adjusting results by dilution factor
+  summarise(result = mean(result)*2)
+  # Adjusting results by dilution factor
+  tib_selected <- list(
+    # Merging included patients...
+    tib_selected %>%
+      filter(
+        includecyto,
+        !is.na(sfseverity_highest),
+        #!is.na(id),
+        !is.na(day)
+      ),
+    # ...and healthy patients through collected list and normal donor samples
+    bind_rows(
+      tib_selected %>%
+        filter(id %in% (filter(tib_patients_annotations, healthy)$id)),
+      tib_selected %>%
+        filter(bmp_sample == "Normal Donor")
+    )
+  )
+  return(tib_selected)
+}
+
+# Function to plot the cytokine plots with line plot by day with a simple linear regression side by side
+fun_plot_cytokine <- function(cytokine, name = cytokine, error = FALSE){
+  
+  # Calling fun_cytokine_select to filter and process QC for selected cytokine
+  tib_plot <- fun_cytokine_select(cytokine)
+  
+  # Plot 1: Scatter plot over time
+  plot_one <- tib_plot[[1]] %>%
+    ggplot(aes(x = day, y = result, color = sfseverity_highest)) +
+    # Jitter plot, not necessary for discrete day plot
+    # geom_jitter(width = 0.1) +
+    geom_point() + 
+    # Adding trend line from mean to mean, colored by severity
+    stat_summary(fun=mean, geom="line", aes(color=sfseverity_highest, group=sfseverity_highest)) +
+    # Horizontol line for normal donor
+    geom_hline(aes(yintercept = mean(pull(tib_plot[[2]], result)), colour = "Normal Donor"), linetype = "dashed", color = "grey", size = 1) +
+    # Error bars, default not shown
+    {if(error) stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.05)} +
+    # Somewhat hacky way of showing N for each group at the time at 103% of the max value to ensure it shows up on the plot, not used
+    # geom_text(data = tib_plot_tally, aes(label = paste0("n = ", n)), y = max(tib_plot[[1]]$result)*1.03, colour="grey20", size=3.5) +
+    # Removing X axis variable name/label
+    theme(axis.title.x=element_blank()) +
+    # Setting titles
+    labs(color = "Severity", title = cytokine) + ylab("pg/mL") + xlab("Day") +
+    # Using list of colors above
+    scale_colour_manual(values = list_plot_colors)
+
+  # Plot 2: Regression over time
+  # Linear regression
+  formula <- y ~ poly(x, 2, raw = TRUE)
+  plot_two <- tib_plot[[1]] %>%
+    ggplot(aes(x = day, y = result, color = sfseverity_highest)) +
+    # Plotting linear regression
+    geom_smooth(aes(fill = sfseverity_highest), method = "lm", formula = formula) +
+    # Adding CI
+    stat_poly_eq(
+      aes(label = paste(stat(p.value.label), stat(rr.label), sep = "*\", \"*")),
+      formula = formula,
+      label.x = "right", label.y = "bottom", size = 3,
+      parse = TRUE
+      ) +
+    # Removing X-axis title, legend (since it's used above)
+    theme(axis.title.x=element_blank(), legend.position = "none") +
+    # Adding labels
+    labs(color = "Severity") + ylab("pg/mL") + xlab("Day") +
+    # Using list of colors above
+    scale_colour_manual(values = list_plot_colors) +
+    scale_fill_manual(values = list_plot_colors)
+  return( 
+    list(plot_one, plot_two)
+  )
+}
+
+# Function to plot the cytokine plots with line plot by day with a simple linear regression side by side
+fun_plot_cytokine_bypt <- function(cytokine, name = cytokine, error = FALSE){
+  # Calling fun_cytokine_select to filter and process QC for selected cytokine
+  tib_plot <- fun_cytokine_select(cytokine)
+  
+  # Plot 1: Scatter plot over time
+  plot_one <- tib_plot[[1]] %>%
+    ggplot(aes(x = day, y = result, color = sfseverity_highest, group = id)) +
+    # Jitter plot, not necessary for discrete day plot
+    # geom_jitter(width = 0.1) +
+    geom_point() + 
+    # Adding a line plot per patient
+    geom_line() +
+    # Horizontol line for normal donor
+    geom_hline(aes(yintercept = mean(pull(tib_plot[[2]], result)), colour = "Normal Donor"), linetype = "dashed", color = "grey", size = 1) +
+    # Error bars, default not shown
+    {if(error) stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.05)} +
+    # Removing X axis variable name/label
+    theme(axis.title.x=element_blank()) +
+    # Setting titles
+    labs(color = "Severity", title = cytokine) + ylab("pg/mL") + xlab("Day") +
+    # Using list of colors above
+    scale_colour_manual(values = list_plot_colors)
+}
+# Box plots of cytokine data
+fun_plot_cytokine_box <- function(cytokine){
+  # Creating additional factor level for healthy patients
+  sf_levels_healthy <- c(c("Healthy"), rev(sf_levels))
+  
+  # Calling fun_cytokine_select to filter and process QC for selected cytokine
+  tib_plot <- fun_cytokine_select(cytokine)
+
+  tib_plot <- tib_plot[[1]] %>%
+    bind_rows(select(tib_plot[[2]], result) %>% mutate(daygroup_box = "Days 1-9")) %>%
+    bind_rows(select(tib_plot[[2]], result) %>% mutate(daygroup_box = "Days >10")) %>%
+    mutate(sfseverity_highest = factor(case_when(
+        is.na(day) ~ "Healthy",
+        TRUE ~ as.character(sfseverity_highest)
+        ), levels = sf_levels_healthy
+      )
+    ) %>%
+    group_by(id, daygroup_box, sfseverity_highest) %>%
+    summarise(
+      result = max(result)
+    ) %>%
+    mutate(daygroup_box = factor(daygroup_box, levels = c("Days 1-9", "Days >10")))
+
+  # Tallying N per group for purposes of labeling, duplicating due to quirk of writing a label per group
+  tib_plot_tally <- tib_plot %>% group_by(daygroup_box, sfseverity_highest) %>% summarise(ns = n()) %>% left_join(tib_plot %>% group_by(daygroup_box) %>% tally)
+
+  # p-value comparison pairings
+  comparisons <- list(
+    c(sf_levels_healthy[1], sf_levels_healthy[2]),
+    c(sf_levels_healthy[2], sf_levels_healthy[3]),
+    c(sf_levels_healthy[3], sf_levels_healthy[4]),
+    c(sf_levels_healthy[1], sf_levels_healthy[3]),
+    c(sf_levels_healthy[2], sf_levels_healthy[4]),
+    c(sf_levels_healthy[1], sf_levels_healthy[4])
+  )
+  plot_one <- tib_plot %>%
+    ggplot(aes(x = sfseverity_highest, y = result, color = sfseverity_highest)) +
+    # Box plot with jitter
+    geom_boxplot() +
+    geom_jitter(width = 0.1) +
+    # p-values from above
+    stat_compare_means(comparisons = comparisons, size = 2.5) +
+    # Labels
+    labs(color = "Severity", title = cytokine) + ylab("pg/mL") +
+    # Colors
+    scale_colour_manual(values = rev(list_plot_colors)) +
+    # Legend colors
+    guides(color = guide_legend(reverse = TRUE)) +
+    # Somewhat hacky way of showing N for each group at the time at -3% of the max value to ensure it shows up on the plot
+    geom_text(data = tib_plot_tally, aes(label = paste0("n = ", ns)), y = -max(tib_plot$result)*0.01, colour="grey20", size=2.5) +
+    # Remove ticks and variable labels
+    theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank()) + 
+    facet_wrap(~daygroup_box)
+  return(plot_one)
+}
+
+# Scatter plots of cytokine data
+fun_plot_cytokine_scatter <- function(cytokine){
+  # Creating additional factor level for healthy patients
+  sf_levels_healthy <- c(c("Healthy"), rev(sf_levels))
+  
+  # Calling fun_cytokine_select to filter and process QC for selected cytokine
+  tib_plot <- fun_cytokine_select(cytokine)
+
+  tib_plot <- tib_plot[[1]] %>%
+    bind_rows(select(tib_plot[[2]], result) %>% mutate(daygroup_box = "Days 1-9")) %>%
+    bind_rows(select(tib_plot[[2]], result) %>% mutate(daygroup_box = "Days >10")) %>%
+    mutate(sfratio_lowest = case_when(
+        is.na(day) ~ 100.0/0.21,
+        TRUE ~ sfratio_lowest
+      ),
+      sfseverity_highest = factor(case_when(
+        is.na(day) ~ "Healthy",
+        TRUE ~ as.character(sfseverity_highest)
+        ), levels = sf_levels_healthy
+      )
+    ) %>%
+    group_by(id, daygroup_box, sfratio_lowest, sfseverity_highest) %>%
+    summarise(
+      result = max(result)
+    ) %>%
+    mutate(daygroup_box = factor(daygroup_box, levels = c("Days 1-9", "Days >10")))
+
+  plot_one <- tib_plot %>%
+    ggplot(aes(x = sfratio_lowest, y = result, color = sfseverity_highest)) +
+    # Scatter plot
+    geom_point() +
+    # Labels
+    labs(color = "Severity", title = cytokine) + ylab("pg/mL") + xlab("SF Ratio") +
+    # Colors
+    scale_colour_manual(values = rev(list_plot_colors)) +
+    # Legend colors
+    guides(color = guide_legend(reverse = TRUE)) +
+    scale_x_reverse() +
+    facet_wrap(~daygroup_box)
+  return(plot_one)
+}
+
+# Saves all 5 plots as images
+fun_cytokine_png <- function(cytokine) {
+  str_name <- cytokine %>%
+    tolower() %>%
+    str_replace_all("[:punct:]", "-") %>%
+    str_replace_all(" ", "_")
+  plot_cytokine <- fun_plot_cytokine(cytokine)
+  if(nrow(plot_cytokine[[1]]$data) > 0) {
+    print(plot_cytokine[[1]])
+    print(plot_cytokine[[2]])
+  } else {
+    plot_cytokine <- list(ggplot(data = data.frame()) + geom_blank(), ggplot(data = data.frame()) + geom_blank())
+  }
+  ggsave(paste0(STR_PLOT_DIR_CYTOKINE, str_name, "-scatter-regression.png"),
+         plot_cytokine[[1]] + plot_cytokine[[2]], width = 12, height = 4)
+  
+  plot_cytokine_bypt <- fun_plot_cytokine_bypt(cytokine)
+  print(plot_cytokine_bypt)
+  ggsave(paste0(STR_PLOT_DIR_CYTOKINE, str_name, "-scatter-line-bypt.png"),
+         plot_cytokine_bypt, width = 6, height = 4)
+  
+  plot_cytokine_box <- fun_plot_cytokine_box(cytokine)
+  if(nrow(plot_cytokine_box$data) > 0) {
+    print(plot_cytokine_box)
+  } else {
+    plot_cytokine_box <- ggplot(data = data.frame()) + geom_blank()
+  }
+  ggsave(paste0(STR_PLOT_DIR_CYTOKINE, str_name, "-box.png"), plot_cytokine_box, width = 6, height = 4)
+
+  plot_cytokine_scatter <- fun_plot_cytokine_scatter(cytokine)
+  if(nrow(plot_cytokine_scatter$data) > 0) {
+    print(plot_cytokine_scatter)
+  } else {
+    plot_cytokine_scatter <- ggplot(data = data.frame()) + geom_blank()
+  }
+  ggsave(paste0(STR_PLOT_DIR_CYTOKINE, str_name, "-scatter.png"), plot_cytokine_scatter, width = 6, height = 4)
+}
+
+# Getting list of all cytokines across Luminex runs
+list_cytokines_all <- str_replace(colnames(select(tib_cytokine_data, ends_with("result"))), "_result", "")
+
+# Saves all plots
+lapply(list_cytokines_all, fun_cytokine_png)
+
+########################
+#     EXCEL EXPORT     #
+########################
+
+# QC: Duplicates marked and grouped
+tib_cytokines_dups_all %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_CYTOKINE, "cytokine_duplicates.xlsx"))
+
+# All cytokine data
+tib_cytokine_data_save %>%
+  writexl::write_xlsx(paste0(STR_DATA_DIR_CYTOKINE, "cytokine_all.xlsx"))
+
+
+```
