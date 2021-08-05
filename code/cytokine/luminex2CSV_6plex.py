@@ -17,23 +17,26 @@ def is_number(s):
     return False
 
 # Convert Luminex well coordinates from Excel sheets into a string to match output
-def lumify(plate, x, y):
-    return str(x*12+y+1) + "(" + str(plate) + "," + chr(ord('@')+(x+1)) + str(y+1) + ")"
+def lumify(plate, x, y, reverse = False):
+    if reverse:
+        return str(x+y*8+1) + "(" + str(plate) + "," + chr(ord('@')+(x+1)) + str(y+1) + ")"
+    else:
+        return str(x*12+y+1) + "(" + str(plate) + "," + chr(ord('@')+(x+1)) + str(y+1) + ")"
     
 # Since there are 3 files with identical header rows for the 30-plex samples, using
 # logical variable to identify when it's already been printed into output CSV file
 logHeader = False
 
 # Storing output in luminex_30plex.csv in data folder
-with open('data/cytokine/luminex_30plex.csv', 'w', newline='') as csvfile:
+with open('data/cytokine/luminex_6plex.csv', 'w', newline='') as csvfile:
     writer = csv.writer(csvfile, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
     
-    # For loop through 4 separate experiment days
+    # For loop through 3 separate experiment days
     for intFolder in range(1,5):
-        strCytokineFolder = STR_BIOBANK + "Cytokines/Raw luminex data/30Plex_Day" + str(intFolder)
+        strCytokineFolder = STR_BIOBANK + "Cytokines/Raw luminex data/6Plex_Day" + str(intFolder)
 
         # First, opening Excel sheet with key for what each well represents
-        strFile = glob.glob(strCytokineFolder + "/*Layout*.xls*")[0]
+        strFile = glob.glob(strCytokineFolder + "/*.xls*")[0]
         print(strFile)
         sheet = xlrd.open_workbook(strFile).sheet_by_index(0)
         
@@ -67,17 +70,21 @@ with open('data/cytokine/luminex_30plex.csv', 'w', newline='') as csvfile:
                     if "ID" in sheet.cell_value(i, j):
                         i = i + 1
                         while i < sheet.nrows:
-                            welldate[sheet.cell_value(i,j)] = datetime(*xlrd.xldate_as_tuple(int(sheet.cell_value(i,j + 1)), 0)) if is_number(sheet.cell_value(i,j + 1)) else ""
-                            wellsample[sheet.cell_value(i,j)] = str(int(sheet.cell_value(i,j + 2))) if is_number(sheet.cell_value(i,j + 2)) else sheet.cell_value(i,j + 2)
-                            wellbmp[sheet.cell_value(i,j)] = sheet.cell_value(i,j + 3).encode("ascii", "ignore")
+                            c = sheet.cell_value(i,j)
+                            if is_number(c):
+                                c = str(int(c))
+                            welldate[c] = "" if sheet.cell_value(i,j + 1) == "" else datetime(*xlrd.xldate_as_tuple(int(sheet.cell_value(i,j + 1)), 0))
+                            wellsample[c] = sheet.cell_value(i,j + 2)
+                            wellbmp[c] = sheet.cell_value(i,j + 3)
                             i = i + 1
                     # If this is the system where there ARE plate duplicates denoting what samples
                     # are where, then read in each the BMP sample info to parse date/patient
                     else:
                         i = i + 1
                         while i < sheet.nrows:
-                            welldate[sheet.cell_value(i,j)] = datetime(*xlrd.xldate_as_tuple(int(sheet.cell_value(i,j + 1)), 0))
-                            wellsample[sheet.cell_value(i,j)] = str(int(sheet.cell_value(i,j + 2))) if is_number(sheet.cell_value(i,j + 2)) else sheet.cell_value(i,j + 2)
+                            c = sheet.cell_value(i,j)
+                            welldate[c] = "" if sheet.cell_value(i,j + 1) == "" else datetime(*xlrd.xldate_as_tuple(int(sheet.cell_value(i,j + 1)), 0))
+                            wellsample[c] = str(int(sheet.cell_value(i,j + 2))) if is_number(sheet.cell_value(i,j + 2)) else sheet.cell_value(i,j + 2)
                             i = i + 1
                     j = sheet.ncols
             i = i + 1
@@ -94,40 +101,39 @@ with open('data/cytokine/luminex_30plex.csv', 'w', newline='') as csvfile:
                     for x in range(0, 8):
                         for y in range(0, 12):
                             c = sheet.cell_value(i+x,1+y)
-                            if c in welldate.keys() and lumify(plate, x, y) not in coorddate.keys():
-                                coorddate[lumify(plate, x, y)] = welldate[c]
-                                coordsample[lumify(plate, x, y)] = wellsample[c]
-                            if lumify(plate, x, y) not in coordbmp.keys():
-                                if c in wellbmp.keys():
-                                    coordbmp[lumify(plate, x, y)] = wellbmp[c]
-                                else:
-                                    coordbmp[lumify(plate, x, y)] = c
+                            if is_number(c):
+                                c = str(int(c))
+                            if c in welldate.keys() and lumify(plate, x, y, (intFolder==2) | (intFolder==4)) not in coorddate.keys():
+                                coorddate[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = welldate[c]
+                                coordsample[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = wellsample[c]
+                            if lumify(plate, x, y, (intFolder==2) | (intFolder==4)) not in coordbmp.keys():
+                                coordbmp[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = c
                 # If plate just has BMP sample info again, due to the few weirdly named BMP samples
                 # match sample to patient/date
                 else:
                     for x in range(0, 8):
                         for y in range(0, 12):
                             c = sheet.cell_value(i+x,1+y)
-                            coordbmp[lumify(plate, x, y)] = c
-                            if is_number(c[0:2]):
+                            coordbmp[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = c
+                            if is_number(c[0:4]):
                                 cList = c.split("-")
-                                coorddate[lumify(plate, x, y)] = datetime(int("20" + cList[2][4:6]), int(cList[2][0:2]), int(cList[2][2:4]))
+                                coorddate[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = datetime(int("20" + cList[2][4:6]), int(cList[2][0:2]), int(cList[2][2:4]))
                                 if "CTC" in cList[1]:
-                                    coordsample[lumify(plate, x, y)] = str(wellsample[c])
+                                    coordsample[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = str(wellsample[c])
                                 else:
-                                    coordsample[lumify(plate, x, y)] = str(int("".join([c for c in cList[1] if c.isdigit()])))
+                                    coordsample[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = str(int("".join([c for c in cList[1] if c.isdigit()])))
                             else:
-                                if c in welldate.keys() and lumify(plate, x, y) not in coorddate.keys():
-                                    coorddate[lumify(plate, x, y)] = welldate[c]
-                                    coordsample[lumify(plate, x, y)] = str(wellsample[c])
+                                if c in welldate.keys() and lumify(plate, x, y, (intFolder==2) | (intFolder==4)) not in coorddate.keys():
+                                    coorddate[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = welldate[c]
+                                    coordsample[lumify(plate, x, y, (intFolder==2) | (intFolder==4))] = str(wellsample[c])
                 i = i + 8
             else:
                 i = i + 1 
         # Reading in the actual Luminex output data
-        strLuFile = glob.glob(strCytokineFolder + "/*.csv")[0]
+        strLuFile = glob.glob(strCytokineFolder + "/ACab*.csv")[0]
         print(strLuFile)
         dictLuminex = dict()
-        with open(strLuFile, newline='') as luminexdata:
+        with open(strLuFile, newline='', encoding="utf-8") as luminexdata:
             lumReader = csv.reader(luminexdata, delimiter=',')
             strData = ""
             for row in lumReader:
@@ -180,26 +186,26 @@ with open('data/cytokine/luminex_30plex.csv', 'w', newline='') as csvfile:
                 header = header + [y + "_" + x.lower().replace(" ", "-").replace("%", "") for y in dictLuminex[x][0][2:len(dictLuminex[x][0])-1]] + \
                   ["LIMIT" + y + "_" + x.lower().replace(" ", "-").replace("%", "") for y in dictLuminex[x][0][2:len(dictLuminex[x][0])-1]]
             for x in listLumResultsRepl:
-                header = header + [y + "_" + x.lower().replace(" ", "-").replace("%", "") for y in dictLuminex[x]["HEADER"]]
+                header = header + [y + "_" + x.lower().replace(" ", "-").replace("%", "") for y in dictLuminex[x]["HEADER"][0:int((len(dictLuminex["Result"][i])-3)/2)]]
             header = ["luminex_day", "bmp_sample", "date", "id"] + dictLuminex["Result"][0][0:2] + header + \
               [dictLuminex["Result"][0][len(dictLuminex["Result"][0])-1]]
             writer.writerow(header)
         # Writing actual results to to file, same process as above
         for i in range(1,len(dictLuminex["Result"])):
-            sample = str(coordsample[dictLuminex["Result"][i][0]] if dictLuminex["Result"][i][0] in coordsample.keys() else coordbmp[dictLuminex["Result"][i][0]])
+            sample = str(coordsample[dictLuminex["Result"][i][0]] if dictLuminex["Result"][i][0] in coordsample.keys() else "ControlSta")
             if ("Control" not in sample) & ("Sta" not in sample):
-                row = ["30Plex" + str(intFolder),
-                         coordbmp[dictLuminex["Result"][i][0]],
+                row = ["6Plex" + str(intFolder),
+                         coordbmp[dictLuminex["Result"][i][0]] if dictLuminex["Result"][i][0] in coordbmp.keys() else "",
                          coorddate[dictLuminex["Result"][i][0]] if dictLuminex["Result"][i][0] in coorddate.keys() else "",
-                         sample] + \
+                         coordsample[dictLuminex["Result"][i][0]] if dictLuminex["Result"][i][0] in coordsample.keys() else ""] + \
                         dictLuminex["Result"][i][0:2] + \
                         [y for x in listLumResults for y in dictLuminex[x][i][2:len(dictLuminex[x][i])-1]]
                 additionalRow = []
                 for x in listLumResultsRepl:
                   if dictLuminex["Result"][i][1] in dictLuminex[x].keys():
-                    additionalRow = [y for y in dictLuminex[x][dictLuminex["Result"][i][1]]]
+                    additionalRow = [y for y in dictLuminex[x][dictLuminex["Result"][i][1]][0:int((len(dictLuminex["Result"][i])-3)/2)]]
                   else:
-                    additionalRow = ["" for y in dictLuminex[x]["HEADER"]]
+                    additionalRow = ["" for y in dictLuminex[x]["HEADER"][0:int((len(dictLuminex["Result"][i])-3)/2)]]
                 writer.writerow(
                     row + \
                     additionalRow + \
